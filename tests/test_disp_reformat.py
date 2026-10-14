@@ -83,6 +83,60 @@ class TestReformatStack:
                 )
 
 
+class TestReformatStackReferenceEpoch:
+    @pytest.fixture(scope="class")
+    def ds_pair(self, tmp_path_factory):
+        input_files = list(INPUT_DISP_S1_DIR.glob("*.nc"))
+        tmp_path = tmp_path_factory.mktemp("test")
+        reformat_stack(input_files=input_files, output_name=tmp_path / "base.zarr")
+        reformat_stack(
+            input_files=input_files,
+            output_name=tmp_path / "ref0.zarr",
+            add_reference_epoch=True,
+        )
+        ds_base = xr.open_zarr(tmp_path / "base.zarr", consolidated=False)
+        ds_ref0 = xr.open_zarr(tmp_path / "ref0.zarr", consolidated=False)
+        return ds_base, ds_ref0
+
+    @pytest.mark.skipif(
+        SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"
+    )
+    def test_reference_epoch_prepended(self, ds_pair):
+        ds_base, ds_ref0 = ds_pair
+        assert ds_ref0.sizes["time"] == ds_base.sizes["time"] + 1
+        assert ds_ref0.time.values[0] < ds_base.time.values[0]
+        assert ds_ref0.time.values[0] == ds_ref0.reference_time.values[0]
+        np.testing.assert_array_equal(ds_ref0.time.values[1:], ds_base.time.values)
+        assert ds_ref0.perpendicular_baseline.values[0] == 0
+
+    @pytest.mark.skipif(
+        SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"
+    )
+    def test_reference_epoch_values(self, ds_pair):
+        ds_base, ds_ref0 = ds_pair
+        for ds_name in ds_base.data_vars:
+            if "time" not in ds_base[ds_name].dims or ds_base[ds_name].ndim != 3:
+                continue
+            first = ds_ref0[ds_name].isel(time=0).values
+            if "displacement" in ds_name:
+                np.testing.assert_array_equal(first, 0)
+            else:
+                assert np.isnan(first).all()
+            np.testing.assert_array_equal(
+                ds_ref0[ds_name].isel(time=slice(1, None)).values,
+                ds_base[ds_name].values,
+            )
+
+
+def test_reference_epoch_netcdf_unsupported(tmp_path):
+    with pytest.raises(ValueError, match=r"only supported for \.zarr"):
+        reformat_stack(
+            input_files=[],
+            output_name=tmp_path / "test.nc",
+            add_reference_epoch=True,
+        )
+
+
 def test_combine_quality_masks_logical_or():
     """Test combine_quality_masks with default logical_or reduction."""
     # Create test quality datasets

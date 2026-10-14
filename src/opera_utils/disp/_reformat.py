@@ -59,6 +59,7 @@ def reformat_stack(
     reference_coherence_threshold: float = 0.7,
     process_chunk_size: tuple[int, int] = (2048, 2048),
     do_round: bool = True,
+    add_reference_epoch: bool = False,
 ) -> None:
     """Reformat NetCDF DISP-S1 files into one NetCDF/Zarr stack.
 
@@ -129,6 +130,13 @@ def reformat_stack(
         Defaults to (2048, 2048).
     do_round : bool
         If True, rounds mantissa bits of floating point rasters to compress the data.
+    add_reference_epoch : bool
+        If True, prepend the first reference time to the `time` dimension so the
+        stack starts at zero displacement.
+        Displacement layers are zero at this epoch, `perpendicular_baseline` is
+        zero, and other time-varying layers are NaN since no product covers it.
+        Only supported for ".zarr" outputs.
+        Default is False.
 
     """
     start_time = time.time()
@@ -140,6 +148,11 @@ def reformat_stack(
         out_format = "zarr"
     else:
         msg = "Only .nc and .zarr output formats are supported"
+        raise ValueError(msg)
+    if add_reference_epoch and out_format != "zarr":
+        # NetCDF outputs link the quality layers as HDF5 virtual datasets of the
+        # inputs, which have no slot for an extra epoch.
+        msg = "add_reference_epoch is only supported for .zarr outputs"
         raise ValueError(msg)
 
     if drop_vars is None:
@@ -158,6 +171,7 @@ def reformat_stack(
     dps = DispProductStack.from_file_list(input_files)
     df = dps.to_dataframe()
     reference_datetimes = df.reference_datetime.dt.tz_localize(None)
+    first_reference_datetime = reference_datetimes.iloc[0]
 
     # #####################
     # Write minimal dataset
@@ -187,6 +201,8 @@ def reformat_stack(
     # Only keep one water mask, as it's repeated for all frame outputs
     ds_minimal["water_mask"] = ds_minimal["water_mask"].isel(time=0)
     ds_minimal["perpendicular_baseline"] = ds_bperp
+    if add_reference_epoch:
+        ds_minimal = _prepend_reference_epoch(ds_minimal, first_reference_datetime)
 
     # Configure compression encoding
     if out_format == "zarr":
@@ -213,7 +229,10 @@ def reformat_stack(
         for ds in QUALITY_DATASETS
         if ds != "water_mask" and str(ds) not in drop_vars
     ]
-    ds_remaining = ds[remaining_dsets].chunk(
+    ds_remaining = ds[remaining_dsets]
+    if add_reference_epoch:
+        ds_remaining = _prepend_reference_epoch(ds_remaining, first_reference_datetime)
+    ds_remaining = ds_remaining.chunk(
         {
             "time": out_shard_dict["time"],
             "y": process_chunk_dict["y"],
@@ -310,6 +329,7 @@ def reformat_stack(
         process_chunk_size=process_chunk_size,
         shard_factors=shard_factors,
         do_round=do_round,
+        add_reference_epoch=add_reference_epoch,
     )
     print(f"Wrote displacement at {time.time() - start_time:.1f}s")
     if str(DisplacementDataset.SHORT_WAVELENGTH) in ds.data_vars:
@@ -323,8 +343,35 @@ def reformat_stack(
             process_chunk_size=process_chunk_size,
             shard_factors=shard_factors,
             do_round=do_round,
+            add_reference_epoch=add_reference_epoch,
         )
         print(f"Wrote short_wavelength_displacement at {time.time() - start_time:.1f}s")
+
+
+def _prepend_reference_epoch(
+    obj: xr.Dataset | xr.DataArray, reference_datetime: pd.Timestamp
+) -> xr.Dataset | xr.DataArray:
+    """Reindex `obj` along `time` to start at `reference_datetime`.
+
+    Rasters get NaN at the new epoch, while the per-epoch metadata gets the values
+    known at the reference time.
+    """
+    reference_datetime = pd.Timestamp(reference_datetime)
+    new_time = pd.DatetimeIndex([reference_datetime]).append(
+        pd.DatetimeIndex(obj.time.values)
+    )
+    known_values = {
+        "reference_time": reference_datetime.to_datetime64(),
+        "perpendicular_baseline": 0.0,
+    }
+    if "spatial_ref" in obj.coords:
+        # Integer CRS placeholder; NaN would cast it to float
+        known_values["spatial_ref"] = obj["spatial_ref"].values[0]
+    names = (
+        set(obj.variables) if isinstance(obj, xr.Dataset) else {obj.name, *obj.coords}
+    )
+    fill_value = {name: v for name, v in known_values.items() if name in names}
+    return obj.reindex(time=new_time, fill_value=fill_value)
 
 
 def _get_transform(ds: xr.Dataset) -> Affine:
@@ -363,6 +410,7 @@ def _write_rebased_stack(
     process_chunk_size: tuple[int, int] = (2048, 2048),
     shard_factors: tuple[int, int, int] = (1, 4, 4),
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
+    add_reference_epoch: bool = False,
 ) -> None:
     da_displacement = ds[str(data_var)]
 
@@ -401,6 +449,7 @@ def _write_rebased_stack(
         reference_datetimes=reference_datetimes,
         process_chunk_size=process_chunk_size,
         nan_policy=nan_policy,
+        add_reference_time=add_reference_epoch,
     )
     if reference_method is not ReferenceMethod.NONE:
         crs = CRS.from_wkt(ds.spatial_ref.crs_wkt)
@@ -420,7 +469,12 @@ def _write_rebased_stack(
     else:
         da_disp_referenced = da_disp
 
-    da_disp_referenced = da_disp_referenced.assign_coords(spatial_ref=ds.spatial_ref)
+    spatial_ref = ds.spatial_ref
+    if add_reference_epoch:
+        spatial_ref = _prepend_reference_epoch(
+            spatial_ref, next(iter(reference_datetimes))
+        )
+    da_disp_referenced = da_disp_referenced.assign_coords(spatial_ref=spatial_ref)
     if do_round and np.issubdtype(da_disp_referenced.dtype, np.floating):
         da_disp_referenced.data = round_mantissa(da_disp_referenced.data, keep_bits=10)
 

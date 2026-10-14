@@ -52,7 +52,7 @@ def create_rebased_displacement(
     process_chunk_size : tuple[int, int], optional
         Chunk size for processing. Defaults to (512, 512).
     add_reference_time : bool, optional
-        Whether to add a zero array for the reference time.
+        Whether to prepend a zero array labeled with the first reference time.
         Defaults to False.
     nan_policy : choices = ["propagate", "omit"]
         Whether to propagate or omit (zero out) NaNs in the data.
@@ -88,14 +88,25 @@ def create_rebased_displacement(
 
     if add_reference_time:
         # Add initial reference epoch of zeros, and rechunk
-        rebased_da = xr.concat(
-            [xr.full_like(rebased_da[0], 0), rebased_da],
-            dim="time",
+        # Label the zeros with the first reference time; copying `rebased_da[0]`
+        # alone would duplicate the first secondary time instead.
+        reference_epoch = xr.full_like(rebased_da[0], 0).assign_coords(
+            time=_to_time_coord_value(next(iter(reference_datetimes)), rebased_da.time)
         )
+        rebased_da = xr.concat([reference_epoch, rebased_da], dim="time")
         # Ensure correct dimension order
         rebased_da = rebased_da.transpose("time", "y", "x")
 
     return rebased_da
+
+
+def _to_time_coord_value(dt: datetime | pd.Timestamp, time_coord: xr.DataArray):
+    """Convert `dt` to match the timezone-awareness of `time_coord`."""
+    ts = pd.Timestamp(dt)
+    if np.issubdtype(time_coord.dtype, np.datetime64) and ts.tzinfo is not None:
+        # datetime64 coordinates are timezone-naive (UTC)
+        return ts.tz_convert(None)
+    return ts
 
 
 def rebase_timeseries(

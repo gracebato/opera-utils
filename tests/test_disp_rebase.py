@@ -114,9 +114,9 @@ def test_rebase_with_nan_values(nan_policy: str):
     # Create 3D array with some NaN values at one pixel
     raw_data = np.ones((3, 2, 2), dtype=np.float32)
     raw_data[1, :, :] *= 2  # Second time step values = 2
-    raw_data[
-        2, :, :
-    ] *= 4  # Third time step values = 4 (6 in the single-reference output)
+    raw_data[2, :, :] *= (
+        4  # Third time step values = 4 (6 in the single-reference output)
+    )
 
     raw_data[0, 0, 0] = np.nan  # Add NaN at first time step: recoverable
     raw_data[1, 1, 0] = np.nan  # Add NaN at second time step: propagates
@@ -224,6 +224,27 @@ class TestCreateRebasedDisplacement:
         assert result.shape == (3, 2, 2)
         np.testing.assert_array_equal(result.values[0], np.zeros((2, 2)))
         np.testing.assert_array_equal(result.values[1:], data)
+
+    def test_create_rebased_displacement_add_reference_time_label(self):
+        """Test the prepended zero epoch is labeled with the first reference date."""
+        data = np.ones((2, 2, 2), dtype=np.float32)
+        times = [datetime(2020, 1, i + 2, tzinfo=timezone.utc) for i in range(2)]
+        da = xr.DataArray(
+            data,
+            dims=["time", "y", "x"],
+            coords={"time": times, "y": np.arange(2), "x": np.arange(2)},
+        )
+
+        reference_dates = [datetime(2020, 1, 1, tzinfo=timezone.utc)] * 2
+
+        result = create_rebased_displacement(
+            da, reference_dates, add_reference_time=True
+        )
+
+        expected_times = np.array(
+            ["2020-01-01", "2020-01-02", "2020-01-03"], dtype="datetime64[ns]"
+        )
+        np.testing.assert_array_equal(result.time.values, expected_times)
 
     @pytest.mark.parametrize("nan_policy", [NaNPolicy.propagate, NaNPolicy.omit])
     def test_create_rebased_displacement_with_nans(self, nan_policy):
